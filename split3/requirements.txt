@@ -1,0 +1,13 @@
+# Split 3 — Blockchain Governance Layer
+# Core requirements (simulation mode — zero extra deps beyond Split 1/2)
+numpy>=1.24.0
+
+# Required for production Hyperledger Fabric integration
+# Only needed when running with --fabric flag
+# fabric-sdk-py>=0.9.0      # pip install fabric-sdk-py
+# grpcio>=1.51.0
+# protobuf>=4.21.0
+
+# Visualisation (optional, used in Colab notebook)
+matplotlib>=3.7.0
+pandas>=2.0.0
