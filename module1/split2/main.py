@@ -13,13 +13,33 @@
 #   --attack none            -- clean baseline (trust scoring only, no attack)
 #   --attack label_flip      -- client flips fraud/legit labels during training
 #   --attack gradient_scale  -- client amplifies gradient update by scale_factor
-#   --attack combined        -- both attacks simultaneously
+#   --attack combined        -- BOTH attacks on the SAME malicious clients
 #
-# Usage:
+# HOW TO RUN MULTIPLE ATTACK TYPES ON DIFFERENT CLIENTS:
+#   argparse only keeps the LAST value for repeated flags, so:
+#       --attack label_flip --malicious 1 --attack gradient_scale --malicious 3
+#   is WRONG — argparse sees attack=gradient_scale, malicious=[3] only.
+#
+#   CORRECT approaches:
+#     a) Combined attack on same clients:
+#        python -m split2.main --attack combined --malicious 1 3
+#        (both label_flip AND gradient_scale applied to clients 1 and 3)
+#
+#     b) Label-flip only:
+#        python -m split2.main --attack label_flip --malicious 1
+#
+#     c) Gradient scale only on client 3:
+#        python -m split2.main --attack gradient_scale --malicious 3 --scale_factor 10
+#
+#     d) Label-flip on client 1, gradient scale on client 3 (different attack per client):
+#        python -m split2.main --attack label_flip --malicious 1 3 --gs_clients 3 --scale_factor 10
+#        (use --gs_clients to specify which subset also gets gradient scaling)
+#
+# Usage examples:
 #   python -m split2.main --synthetic
-#   python -m split2.main --synthetic --attack label_flip --malicious 1
-#   python -m split2.main --synthetic --attack gradient_scale --malicious 1 3
-#   python -m split2.main --data_path ../data/creditcard.csv --attack label_flip
+#   python -m split2.main --data_path ../data/creditcard.csv --attack label_flip --malicious 1
+#   python -m split2.main --data_path ../data/creditcard.csv --attack combined --malicious 1 3 --scale_factor 10
+#   python -m split2.main --data_path ../data/creditcard.csv --attack label_flip --malicious 1 --gs_clients 3 --scale_factor 10
 # =============================================================================
 
 import argparse
@@ -41,7 +61,7 @@ _MODULE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _MODULE_ROOT not in sys.path:
     sys.path.insert(0, _MODULE_ROOT)
 
-from common.data_partition        import (
+from common.data_partition          import (
     load_dataset, dirichlet_partition, make_synthetic_data,
     save_partitions, load_partition,
 )
@@ -50,6 +70,73 @@ from common.attack_simulator        import AttackSimulator
 from common.flower_client           import BankFederatedClient
 
 SERVER_ADDRESS = "127.0.0.1:8081"   # different port from Split 1
+
+
+# =============================================================================
+# MULTI-ATTACK WRAPPER
+# =============================================================================
+
+class MultiAttackSimulator:
+    """
+    Wraps two AttackSimulator instances to apply DIFFERENT attack types to
+    DIFFERENT subsets of malicious clients in the same run.
+
+    Example: label_flip on client 1, gradient_scale on client 3.
+
+    If only one attack type is needed (--attack label_flip or combined),
+    use the regular AttackSimulator directly — this wrapper is only activated
+    when --gs_clients is specified alongside --attack label_flip/none.
+    """
+
+    def __init__(
+        self,
+        flip_clients:  list,
+        scale_clients: list,
+        scale_factor:  float = 5.0,
+        attack_start_round: int = 1,
+    ):
+        all_malicious = list(set(flip_clients) | set(scale_clients))
+
+        # Attacker A: label-flip on flip_clients
+        self.flip_attacker = AttackSimulator(
+            attack_type        = "label_flip" if flip_clients else "none",
+            malicious_clients  = flip_clients,
+            attack_start_round = attack_start_round,
+        )
+
+        # Attacker B: gradient-scale on scale_clients
+        self.scale_attacker = AttackSimulator(
+            attack_type        = "gradient_scale" if scale_clients else "none",
+            malicious_clients  = scale_clients,
+            scale_factor       = scale_factor,
+            attack_start_round = attack_start_round,
+        )
+
+        print(
+            f"[MultiAttack] label_flip on {flip_clients} | "
+            f"gradient_scale on {scale_clients} (×{scale_factor})"
+        )
+
+    def set_round(self, round_num: int) -> None:
+        self.flip_attacker.set_round(round_num)
+        self.scale_attacker.set_round(round_num)
+
+    def is_malicious(self, client_id: int) -> bool:
+        return (self.flip_attacker.is_malicious(client_id) or
+                self.scale_attacker.is_malicious(client_id))
+
+    def poison_data(self, client_id, X, y):
+        return self.flip_attacker.poison_data(client_id, X, y)
+
+    def poison_params(self, client_id, params, global_params):
+        return self.scale_attacker.poison_params(client_id, params, global_params)
+
+    def get_attack_summary(self):
+        return {
+            "flip_clients":  self.flip_attacker.malicious_clients,
+            "scale_clients": self.scale_attacker.malicious_clients,
+            "scale_factor":  self.scale_attacker.scale_factor,
+        }
 
 
 # =============================================================================
@@ -65,19 +152,19 @@ def plot_training_curves(log_path: str, save_dir: str) -> None:
     if not logs:
         return
 
-    rounds  = [l["round"]                    for l in logs]
-    f1s     = [l.get("global_f1", 0)         for l in logs]
-    aucs    = [l.get("global_auc", 0)        for l in logs]
-    recalls = [l.get("global_recall", 0)     for l in logs]
+    rounds  = [l["round"]                        for l in logs]
+    f1s     = [l.get("global_f1", 0)             for l in logs]
+    aucs    = [l.get("global_auc", 0)            for l in logs]
+    recalls = [l.get("global_recall", 0)         for l in logs]
     flagged = [len(l.get("flagged_clients", [])) for l in logs]
 
     fig, axes = plt.subplots(1, 4, figsize=(20, 4))
     fig.suptitle("Split 2 — Trust-Weighted FL + Attack Detection", fontsize=13, fontweight="bold")
 
     for ax, (vals, title, color) in zip(axes[:3], [
-        (f1s,     "Global F1",    "#2196F3"),
-        (aucs,    "Global AUC",   "#4CAF50"),
-        (recalls, "Global Recall","#FF9800"),
+        (f1s,     "Global F1",     "#2196F3"),
+        (aucs,    "Global AUC",    "#4CAF50"),
+        (recalls, "Global Recall", "#FF9800"),
     ]):
         ax.plot(rounds, vals, marker="o", linewidth=2, color=color, markersize=6)
         ax.fill_between(rounds, vals, alpha=0.12, color=color)
@@ -140,35 +227,77 @@ def _run_as_client(cid: int, cache: str, model_type: str, use_smote: bool,
 # =============================================================================
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Split 2 — Trust-Weighted FL + Attack Simulation")
-    p.add_argument("--data_path",    type=str,   default=None)
-    p.add_argument("--synthetic",    action="store_true")
+    p = argparse.ArgumentParser(
+        description="Split 2 — Trust-Weighted FL + Attack Simulation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+ATTACK EXAMPLES
+  Single attack type, single malicious client:
+    python -m split2.main --attack label_flip --malicious 1
+
+  Single attack type, multiple malicious clients:
+    python -m split2.main --attack gradient_scale --malicious 1 3 --scale_factor 8
+
+  BOTH attacks on the SAME malicious clients (combined):
+    python -m split2.main --attack combined --malicious 1 3 --scale_factor 10
+
+  DIFFERENT attacks on DIFFERENT clients (label_flip on C1, gradient_scale on C3):
+    python -m split2.main --attack label_flip --malicious 1 --gs_clients 3 --scale_factor 10
+
+  NOTE: Running --attack twice is NOT supported by argparse (only last value kept).
+        Use --attack combined OR --gs_clients for mixed attacks.
+        """,
+    )
+
+    # Data
+    p.add_argument("--data_path",    type=str,   default=None,
+                   help="Path to CSV dataset (creditcard.csv or ieee_cis_merged.csv)")
+    p.add_argument("--synthetic",    action="store_true",
+                   help="Use built-in synthetic fraud data (no CSV needed)")
+    p.add_argument("--max_samples",  type=int,   default=None,
+                   help="Cap total dataset rows (speeds up testing)")
+
+    # Federated learning
     p.add_argument("--num_clients",  type=int,   default=5)
     p.add_argument("--rounds",       type=int,   default=25)
     p.add_argument("--model",        type=str,   default="dnn", choices=["dnn", "logistic"])
-    p.add_argument("--alpha",        type=float, default=1.0)
+    p.add_argument("--alpha",        type=float, default=1.0,
+                   help="Dirichlet alpha for non-IID partitioning (lower=more non-IID)")
     p.add_argument("--fraction_fit", type=float, default=1.0)
     p.add_argument("--no_smote",     action="store_true")
-    p.add_argument("--max_samples",  type=int,   default=None)
     p.add_argument("--log_dir",      type=str,   default="logs_split2")
-    p.add_argument("--port",         type=int,   default=8081,
-                   help="gRPC port (default 8081 to avoid collision with Split 1)")
+    p.add_argument("--port",         type=int,   default=8081)
+
     # Attack configuration
     p.add_argument("--attack",       type=str,   default="none",
-                   choices=["none", "label_flip", "gradient_scale", "combined"])
+                   choices=["none", "label_flip", "gradient_scale", "combined"],
+                   help=(
+                       "Attack type to inject:\n"
+                       "  none           = no attack (clean baseline)\n"
+                       "  label_flip     = flip fraud labels during training\n"
+                       "  gradient_scale = amplify gradient update by scale_factor\n"
+                       "  combined       = BOTH label_flip AND gradient_scale on --malicious clients"
+                   ))
     p.add_argument("--malicious",    type=int,   nargs="+", default=[1],
-                   help="Client IDs to designate as malicious (default: [1])")
+                   help="Client IDs to attack with --attack type (default: [1])")
+    p.add_argument("--gs_clients",   type=int,   nargs="+", default=None,
+                   help=(
+                       "OPTIONAL: additional client IDs to apply gradient_scale on top of "
+                       "--attack label_flip. Enables different attacks on different clients. "
+                       "Example: --attack label_flip --malicious 1 --gs_clients 3 --scale_factor 10"
+                   ))
     p.add_argument("--scale_factor", type=float, default=5.0,
-                   help="Gradient amplification factor for gradient_scale attack")
+                   help="Gradient amplification multiplier for gradient_scale attack (default: 5.0)")
     p.add_argument("--attack_start", type=int,   default=1,
-                   help="Round to begin attacking (default: 1)")
-    # Hidden subprocess flags
-    p.add_argument("--_client_mode",   action="store_true",  help=argparse.SUPPRESS)
-    p.add_argument("--_cid",     type=int, default=-1,       help=argparse.SUPPRESS)
-    p.add_argument("--_cache",   type=str, default="",       help=argparse.SUPPRESS)
-    p.add_argument("--_model",   type=str, default="dnn",    help=argparse.SUPPRESS)
-    p.add_argument("--_smote",   type=str, default="true",   help=argparse.SUPPRESS)
-    p.add_argument("--_server",  type=str, default="127.0.0.1:8081", help=argparse.SUPPRESS)
+                   help="Round number to begin attacking (default: 1 = from the start)")
+
+    # Hidden subprocess flags (used when re-invoking self as a client process)
+    p.add_argument("--_client_mode",  action="store_true",  help=argparse.SUPPRESS)
+    p.add_argument("--_cid",    type=int, default=-1,       help=argparse.SUPPRESS)
+    p.add_argument("--_cache",  type=str, default="",       help=argparse.SUPPRESS)
+    p.add_argument("--_model",  type=str, default="dnn",    help=argparse.SUPPRESS)
+    p.add_argument("--_smote",  type=str, default="true",   help=argparse.SUPPRESS)
+    p.add_argument("--_server", type=str, default="127.0.0.1:8081", help=argparse.SUPPRESS)
     return p
 
 
@@ -199,12 +328,34 @@ def main() -> None:
     sep = "=" * 65
     print(f"\n{sep}")
     print("  SPLIT 2 — TRUST-WEIGHTED FEDERATED LEARNING")
-    print(f"  Model : {args.model.upper()} | Clients: {args.num_clients} | Rounds: {args.rounds}")
-    print(f"  Attack: {args.attack.upper()} | Malicious: {args.malicious}")
-    print(f"  Engine: Flower gRPC | Server: {server_address}")
+    print(f"  Model    : {args.model.upper()} | Clients: {args.num_clients} | Rounds: {args.rounds}")
+    print(f"  Attack   : {args.attack.upper()} | Malicious: {args.malicious}")
+    if args.gs_clients:
+        print(f"  GS attack: gradient_scale also on clients {args.gs_clients} (×{args.scale_factor})")
+    print(f"  Engine   : Flower gRPC | Server: {server_address}")
     print(f"{sep}\n")
 
-    # Step 1: Load data
+    # ── Step 1: Build attack simulator ────────────────────────────────────────
+    # Handle the case where the user wants DIFFERENT attacks on DIFFERENT clients
+    # using --gs_clients (e.g. label_flip on C1, gradient_scale on C3)
+    if args.gs_clients is not None and args.attack in ("label_flip", "none"):
+        # Different attacks per client: use MultiAttackSimulator
+        attacker = MultiAttackSimulator(
+            flip_clients       = args.malicious if args.attack == "label_flip" else [],
+            scale_clients      = args.gs_clients,
+            scale_factor       = args.scale_factor,
+            attack_start_round = args.attack_start,
+        )
+    else:
+        # Standard: one attack type on all --malicious clients
+        attacker = AttackSimulator(
+            attack_type        = args.attack,
+            malicious_clients  = args.malicious if args.attack != "none" else [],
+            scale_factor       = args.scale_factor,
+            attack_start_round = args.attack_start,
+        )
+
+    # ── Step 2: Load data ─────────────────────────────────────────────────────
     if args.synthetic or args.data_path is None:
         if not args.synthetic:
             print("[Main] No --data_path given — using synthetic data.\n")
@@ -212,7 +363,7 @@ def main() -> None:
     else:
         X, y = load_dataset(args.data_path)
 
-    # Step 2: Partition
+    # ── Step 3: Partition data across bank nodes ──────────────────────────────
     partitions = dirichlet_partition(
         X, y,
         num_clients = args.num_clients,
@@ -220,19 +371,11 @@ def main() -> None:
         max_samples = args.max_samples,
     )
 
-    # Step 3: Write shared partition cache
+    # ── Step 4: Write shared partition cache for subprocess clients ───────────
     cache_path = os.path.join(args.log_dir, ".partition_cache_s2.npz")
     save_partitions(partitions, cache_path)
 
-    # Step 4: Build attack simulator
-    attacker = AttackSimulator(
-        attack_type        = args.attack,
-        malicious_clients  = args.malicious if args.attack != "none" else [],
-        scale_factor       = args.scale_factor,
-        attack_start_round = args.attack_start,
-    )
-
-    # Step 5: Build trust-weighted strategy
+    # ── Step 5: Build trust-weighted strategy ─────────────────────────────────
     strategy = get_trust_strategy(
         num_clients      = args.num_clients,
         fraction_fit     = args.fraction_fit,
@@ -240,7 +383,7 @@ def main() -> None:
         attack_simulator = attacker,
     )
 
-    # Step 6: Spawn client subprocesses
+    # ── Step 6: Spawn client subprocesses ─────────────────────────────────────
     smote_flag   = "false" if args.no_smote else "true"
     client_procs = []
 
@@ -255,7 +398,12 @@ def main() -> None:
             "--_smote",  smote_flag,
             "--_server", server_address,
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
         client_procs.append((cid, proc))
         print(f"  Spawned Bank {cid:02d}  PID={proc.pid}")
 
@@ -273,7 +421,7 @@ def main() -> None:
     print("\n[Main] Clients waiting for server. Starting server now...\n")
     time.sleep(2.0)
 
-    # Step 7: Start Flower gRPC server in MAIN THREAD
+    # ── Step 7: Start Flower gRPC server in MAIN THREAD ───────────────────────
     try:
         fl.server.start_server(
             server_address = server_address,
@@ -302,7 +450,7 @@ def main() -> None:
         if proc.returncode not in (0, None):
             print(f"  [Warning] Bank {cid:02d} exit code: {proc.returncode}")
 
-    # Cleanup
+    # Cleanup partition cache
     try:
         os.remove(cache_path)
     except OSError:
@@ -316,6 +464,7 @@ def main() -> None:
     print(f"\n[Main] {'OK' if all_ok else 'WARN'} Split 2 complete.")
     print(f"         Log  -> {log_path}")
     print(f"         Plot -> {os.path.join(args.log_dir, 'split2_training_curves.png')}")
+    print(f"\n  Next: python -m split3.main --trust_log {log_path}")
 
 
 if __name__ == "__main__":
