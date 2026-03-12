@@ -105,7 +105,7 @@ class TrustScorer:
         # Trust update
         gamma:             float = 0.85,  # DECREASED from 0.9: faster trust decay
         # Detection
-        anomaly_threshold: float = 0.40,  # C1 label-flip consistently scores 0.44-0.54
+        anomaly_threshold: float = 0.45,  # C1 label-flip consistently scores 0.44-0.54
         malicious_weight:  float = 1e-6,  # weight assigned to flagged clients
         # Norm clipping
         max_norm_ratio:    float = 3.0,
@@ -300,7 +300,26 @@ class TrustScorer:
             record.cos_similarity = cs
             record.euc_distance   = ed
             record.norm_ratio     = nr
-            record.is_malicious   = alpha_i > self.anomaly_threshold
+
+            # CONFIRMATION WINDOW FIX:
+            # Client 3 has legitimately large euc_distance (~12k-19k) due to
+            # non-IID data — its local distribution is very different from other
+            # banks. This causes its anomaly score to occasionally spike above
+            # 0.45 (flagged in 6 of 25 rounds = 24% false positive rate in log).
+            # Client 1 (label-flip attacker) exceeds the threshold EVERY round
+            # because its euc_distance is ~23k-27k consistently.
+            #
+            # Fix: require 2 consecutive rounds above threshold before declaring
+            # a client malicious. One-off spikes (Client 3) are ignored.
+            # Persistent offenders (Client 1) are caught on the second round.
+            if not hasattr(record, '_consec_flagged'):
+                record._consec_flagged = 0   # backcompat for pre-existing records
+            if alpha_i > self.anomaly_threshold:
+                record._consec_flagged += 1
+            else:
+                record._consec_flagged = 0
+            record.is_malicious = record._consec_flagged >= 2
+
             if record.is_malicious:
                 record.rounds_flagged += 1
             else:

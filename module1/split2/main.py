@@ -50,6 +50,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import List
 
 import numpy as np
 import matplotlib
@@ -191,20 +192,33 @@ def plot_training_curves(log_path: str, save_dir: str) -> None:
 # =============================================================================
 
 def _run_as_client(cid: int, cache: str, model_type: str, use_smote: bool,
-                   server_address: str) -> None:
-    """Runs inside a subprocess — load partition, connect to server via gRPC."""
+                   server_address: str,
+                   label_flip_clients: List[int] = None,
+                   flip_fraction: float = 1.0,
+                   attack_start_round: int = 1) -> None:
+    """
+    Runs inside a subprocess — load partition, connect to server via gRPC.
+
+    FIX v11: Accepts label_flip_clients so the client subprocess knows whether
+    it should self-poison its training labels. Previously label-flip only
+    existed on the server-side AttackSimulator which never actually corrupted
+    training data (it could only scale gradients AFTER training).
+    """
     import flwr as fl
 
     partition = load_partition(cache, cid)
 
     client = BankFederatedClient(
-        client_id  = cid,
-        X_train    = partition["X_train"],
-        y_train    = partition["y_train"],
-        X_test     = partition["X_test"],
-        y_test     = partition["y_test"],
-        model_type = model_type,
-        use_smote  = use_smote,
+        client_id          = cid,
+        X_train            = partition["X_train"],
+        y_train            = partition["y_train"],
+        X_test             = partition["X_test"],
+        y_test             = partition["y_test"],
+        model_type         = model_type,
+        use_smote          = use_smote,
+        is_label_flip      = cid in set(label_flip_clients or []),
+        flip_fraction      = flip_fraction,
+        attack_start_round = attack_start_round,
     )
 
     for attempt in range(30):
@@ -292,12 +306,17 @@ ATTACK EXAMPLES
                    help="Round number to begin attacking (default: 1 = from the start)")
 
     # Hidden subprocess flags (used when re-invoking self as a client process)
-    p.add_argument("--_client_mode",  action="store_true",  help=argparse.SUPPRESS)
-    p.add_argument("--_cid",    type=int, default=-1,       help=argparse.SUPPRESS)
-    p.add_argument("--_cache",  type=str, default="",       help=argparse.SUPPRESS)
-    p.add_argument("--_model",  type=str, default="dnn",    help=argparse.SUPPRESS)
-    p.add_argument("--_smote",  type=str, default="true",   help=argparse.SUPPRESS)
-    p.add_argument("--_server", type=str, default="127.0.0.1:8081", help=argparse.SUPPRESS)
+    p.add_argument("--_client_mode",   action="store_true",  help=argparse.SUPPRESS)
+    p.add_argument("--_cid",     type=int,   default=-1,       help=argparse.SUPPRESS)
+    p.add_argument("--_cache",   type=str,   default="",       help=argparse.SUPPRESS)
+    p.add_argument("--_model",   type=str,   default="dnn",    help=argparse.SUPPRESS)
+    p.add_argument("--_smote",   type=str,   default="true",   help=argparse.SUPPRESS)
+    p.add_argument("--_server",  type=str,   default="127.0.0.1:8081", help=argparse.SUPPRESS)
+    # FIX v11: label-flip forwarding flags
+    p.add_argument("--_flip_clients",  type=str,   default="",    help=argparse.SUPPRESS,
+                   dest="_flip_clients")
+    p.add_argument("--_flip_fraction", type=float, default=1.0,   help=argparse.SUPPRESS,
+                   dest="_flip_fraction")
     return p
 
 
@@ -310,12 +329,22 @@ def main() -> None:
 
     # ── CLIENT MODE ───────────────────────────────────────────────────────────
     if args._client_mode:
+        # Parse the forwarded flip-clients list (comma-separated ints or empty)
+        flip_clients_sub = []
+        if args._flip_clients:
+            try:
+                flip_clients_sub = [int(x) for x in args._flip_clients.split(",") if x.strip()]
+            except ValueError:
+                pass
         _run_as_client(
-            cid            = args._cid,
-            cache          = args._cache,
-            model_type     = args._model,
-            use_smote      = (args._smote.lower() == "true"),
-            server_address = args._server,
+            cid                = args._cid,
+            cache              = args._cache,
+            model_type         = args._model,
+            use_smote          = (args._smote.lower() == "true"),
+            server_address     = args._server,
+            label_flip_clients = flip_clients_sub,
+            flip_fraction      = args._flip_fraction,
+            attack_start_round = args.attack_start,
         )
         return
 
@@ -336,21 +365,42 @@ def main() -> None:
     print(f"{sep}\n")
 
     # ── Step 1: Build attack simulator ────────────────────────────────────────
-    # Handle the case where the user wants DIFFERENT attacks on DIFFERENT clients
-    # using --gs_clients (e.g. label_flip on C1, gradient_scale on C3)
+    # FIX v11: Server-side AttackSimulator ONLY handles gradient_scale now.
+    # Label-flip is forwarded as subprocess flags so each malicious CLIENT
+    # self-poisons its own training labels at fit() time (the only place where
+    # the corruption actually has an effect on the gradient).
+    #
+    # Determine which clients get which attacks:
+    flip_clients_for_subprocess = []   # clients that self-poison labels
+    scale_clients_for_server    = []   # clients whose grads are scaled server-side
+
+    if args.attack == "label_flip":
+        flip_clients_for_subprocess = args.malicious
+        scale_clients_for_server    = []
+    elif args.attack == "gradient_scale":
+        flip_clients_for_subprocess = []
+        scale_clients_for_server    = args.malicious
+    elif args.attack == "combined":
+        flip_clients_for_subprocess = args.malicious
+        scale_clients_for_server    = args.malicious
+    elif args.gs_clients is not None:
+        flip_clients_for_subprocess = args.malicious if args.attack == "label_flip" else []
+        scale_clients_for_server    = args.gs_clients
+
     if args.gs_clients is not None and args.attack in ("label_flip", "none"):
-        # Different attacks per client: use MultiAttackSimulator
+        # Different attacks per client: use MultiAttackSimulator (gradient-scale only)
         attacker = MultiAttackSimulator(
-            flip_clients       = args.malicious if args.attack == "label_flip" else [],
+            flip_clients       = [],                    # FIX: no longer flips on server
             scale_clients      = args.gs_clients,
             scale_factor       = args.scale_factor,
             attack_start_round = args.attack_start,
         )
     else:
-        # Standard: one attack type on all --malicious clients
+        # Standard: gradient-scale (if any) on scale_clients_for_server
+        server_attack_type = "gradient_scale" if scale_clients_for_server else "none"
         attacker = AttackSimulator(
-            attack_type        = args.attack,
-            malicious_clients  = args.malicious if args.attack != "none" else [],
+            attack_type        = server_attack_type,
+            malicious_clients  = scale_clients_for_server,
             scale_factor       = args.scale_factor,
             attack_start_round = args.attack_start,
         )
@@ -385,18 +435,25 @@ def main() -> None:
 
     # ── Step 6: Spawn client subprocesses ─────────────────────────────────────
     smote_flag   = "false" if args.no_smote else "true"
+    # FIX v11: Forward label-flip client list as comma-separated string
+    flip_flag    = ",".join(str(c) for c in flip_clients_for_subprocess) if flip_clients_for_subprocess else ""
     client_procs = []
 
     print(f"[Main] Spawning {args.num_clients} client subprocesses...")
+    print(f"       Label-flip clients (self-poisoning): {flip_clients_for_subprocess or 'none'}")
+    print(f"       Gradient-scale clients (server-side): {scale_clients_for_server or 'none'}")
     for cid in range(args.num_clients):
         cmd = [
             sys.executable, os.path.abspath(__file__),
             "--_client_mode",
-            "--_cid",    str(cid),
-            "--_cache",  os.path.abspath(cache_path),
-            "--_model",  args.model,
-            "--_smote",  smote_flag,
-            "--_server", server_address,
+            "--_cid",          str(cid),
+            "--_cache",        os.path.abspath(cache_path),
+            "--_model",        args.model,
+            "--_smote",        smote_flag,
+            "--_server",       server_address,
+            "--_flip_clients", flip_flag,
+            "--_flip_fraction",str(args._flip_fraction if hasattr(args, "_flip_fraction") else 1.0),
+            "--attack_start",  str(args.attack_start),
         ]
         proc = subprocess.Popen(
             cmd,

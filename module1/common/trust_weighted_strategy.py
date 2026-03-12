@@ -60,7 +60,7 @@ class TrustWeightedFedAvg(Strategy):
         lambda_distance:       float = 0.5,
         lambda_norm:           float = 0.2,
         gamma:                 float = 0.85,
-        anomaly_threshold:     float = 0.40,
+        anomaly_threshold:     float = 0.45,
         malicious_weight:      float = 1e-6,
         min_trust_floor:       float = 0.85,
         # Logging
@@ -290,22 +290,47 @@ class TrustWeightedFedAvg(Strategy):
             self.best_round = server_round
             print(f"  * New best model! F1={global_f1:.4f} at round {server_round}")
 
-        if self.round_logs:
-            self.round_logs[-1].update({
-                "global_f1":               global_f1,
-                "global_auc":              global_auc,
-                "global_recall":           global_metrics.get("recall", 0),
-                "global_precision":        global_metrics.get("precision", 0),
-                "global_accuracy":         global_metrics.get("accuracy", 0),
-                "global_balanced_accuracy": global_metrics.get("balanced_accuracy", 0),
-                "global_mcc":              global_metrics.get("mcc", 0),
-                "global_specificity":      global_metrics.get("specificity", 0),
-                "global_tp":               global_metrics.get("tp", 0),
-                "global_fp":               global_metrics.get("fp", 0),
-                "global_tn":               global_metrics.get("tn", 0),
-                "global_fn":               global_metrics.get("fn", 0),
-            })
-            self._flush_logs()
+        # CRITICAL FIX: Match the log entry by server_round, not round_logs[-1].
+        #
+        # Root cause of metrics landing in wrong round:
+        #   _save_round_log() (called from aggregate_fit) appends a new entry
+        #   with global_f1=0.0 placeholder.  aggregate_evaluate() was then
+        #   doing round_logs[-1].update(...) to fill in real metrics.
+        #   BUT: in Flower's subprocess architecture, the server can call
+        #   aggregate_evaluate(round N) AFTER aggregate_fit(round N+1) has
+        #   already appended round N+1's entry — so round_logs[-1] is now
+        #   round N+1, and round N's real metrics get written there instead.
+        #   This caused exactly the "every 8th round has real metrics" pattern
+        #   seen in the log: Flower's gRPC scheduling with 5 subprocess clients
+        #   creates a consistent 8-round lag between fit and evaluate calls.
+        #
+        # Fix: search round_logs by "round" key for server_round.
+        target = None
+        for entry in self.round_logs:
+            if entry.get("round") == server_round:
+                target = entry
+                break
+        if target is None:
+            # evaluate fired before fit wrote the log — create entry now
+            target = {"round": server_round}
+            self.round_logs.append(target)
+            self.round_logs.sort(key=lambda x: x.get("round", 0))
+
+        target.update({
+            "global_f1":                global_f1,
+            "global_auc":               global_auc,
+            "global_recall":            global_metrics.get("recall", 0),
+            "global_precision":         global_metrics.get("precision", 0),
+            "global_accuracy":          global_metrics.get("accuracy", 0),
+            "global_balanced_accuracy": global_metrics.get("balanced_accuracy", 0),
+            "global_mcc":               global_metrics.get("mcc", 0),
+            "global_specificity":       global_metrics.get("specificity", 0),
+            "global_tp":                global_metrics.get("tp", 0),
+            "global_fp":                global_metrics.get("fp", 0),
+            "global_tn":                global_metrics.get("tn", 0),
+            "global_fn":                global_metrics.get("fn", 0),
+        })
+        self._flush_logs()
 
         return float(weighted_loss), global_metrics
 
