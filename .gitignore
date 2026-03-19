@@ -58,6 +58,7 @@ logs/.partition_cache.npz
 # ── Training logs & generated outputs ────────────────────────────────────────
 # Commit the schema / example logs if you want, but not gigantic run outputs.
 logs/
+logs1_split1/
 logs_split2/
 governance_output/
 *.log
