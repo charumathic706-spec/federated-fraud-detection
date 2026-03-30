@@ -361,29 +361,53 @@ class FabricGateway:
 # Gateway factory — environment-aware
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# =============================================================================
+# BLOCKCHAIN MODE SWITCH
+# =============================================================================
+# Change USE_REAL_BLOCKCHAIN to switch between simulation and real Ganache.
+#
+#   False (default) → blockchain_sim.py   — no external dependencies
+#   True            → eth_gateway.py      — real Ethereum via Ganache
+#
+# To use real blockchain:
+#   1. npm install -g ganache
+#   2. ganache --deterministic --port 8545    (keep this running)
+#   3. pip install web3 py-solc-x
+#   4. Set USE_REAL_BLOCKCHAIN = True below
+#   5. Run: python -m split2.main --data_path ../data/creditcard.csv
+#
+USE_REAL_BLOCKCHAIN = True   # ← change to True for real Ganache blockchain
+
+
 def create_gateway(
     use_simulation: bool = True,
     org_msp:        str  = "Org1MSP",
     network_config: Optional[Dict] = None,
 ) -> Any:
     """
-    Factory function — returns the appropriate gateway based on environment.
+    Factory — returns the correct gateway based on USE_REAL_BLOCKCHAIN.
 
-    Args:
-        use_simulation:  True → SimBlockchainGateway (no deps, Colab-safe)
-                         False → FabricGateway (requires running Fabric network)
-        org_msp:         MSP identity for this node
-        network_config:  Optional override for Fabric network settings
-
-    Returns:
-        Gateway instance with unified API
+    True  → EthBlockchainGateway (real Ganache, real transactions)
+    False → SimBlockchainGateway (in-memory simulation, no deps)
     """
-    if use_simulation or not HFC_AVAILABLE:
-        from blockchain_sim import SimBlockchainGateway
-        if not use_simulation and not HFC_AVAILABLE:
+    # Real Ethereum blockchain via Ganache
+    if USE_REAL_BLOCKCHAIN:
+        try:
+            from eth_gateway import EthBlockchainGateway
+            return EthBlockchainGateway(org_msp=org_msp)
+        except ImportError as exc:
             logger.warning(
-                "fabric-sdk-py not available — falling back to simulation."
+                f"eth_gateway import failed ({exc}). "
+                "Run: pip install web3 py-solc-x  "
+                "Falling back to simulation."
             )
-        return SimBlockchainGateway(org_msp=org_msp)
-    else:
-        return FabricGateway(network_config=network_config, org_msp=org_msp)
+        except ConnectionError as exc:
+            logger.warning(
+                f"Ganache not reachable ({exc}). "
+                "Run: ganache --deterministic --port 8545  "
+                "Falling back to simulation."
+            )
+
+    # Simulation (default)
+    from blockchain_sim import SimBlockchainGateway
+    return SimBlockchainGateway(org_msp=org_msp)
